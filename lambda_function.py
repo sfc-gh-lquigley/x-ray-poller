@@ -33,12 +33,19 @@ def epoch_to_nanos(ts):
     return str(int(ts * 1_000_000_000))
 
 
-def build_otlp_span(segment, trace_id_hex):
+def build_otlp_span(segment, trace_id_hex, is_subsegment=False):
+    if is_subsegment and segment.get("namespace") == "remote":
+        kind = 3
+    elif is_subsegment:
+        kind = 4
+    else:
+        kind = 2
+
     span = {
         "traceId": trace_id_hex,
         "spanId": segment["id"],
         "name": segment.get("name", "unknown"),
-        "kind": 2,
+        "kind": kind,
         "startTimeUnixNano": epoch_to_nanos(segment["start_time"]),
         "endTimeUnixNano": epoch_to_nanos(segment.get("end_time", segment["start_time"] + 0.001)),
         "attributes": [],
@@ -93,7 +100,7 @@ def build_otlp_span(segment, trace_id_hex):
 def process_subsegments(subsegments, trace_id_hex, parent_span_id):
     spans = []
     for sub in subsegments:
-        sub_span = build_otlp_span(sub, trace_id_hex)
+        sub_span = build_otlp_span(sub, trace_id_hex, is_subsegment=True)
         sub_span["parentSpanId"] = parent_span_id
         spans.append(sub_span)
         if "subsegments" in sub:
@@ -191,6 +198,10 @@ def handler(event, context):
 
             for seg_doc in trace_data.get("Segments", []):
                 segment = json.loads(seg_doc["Document"])
+
+                if segment.get("parent_id"):
+                    continue
+
                 span = build_otlp_span(segment, trace_id_hex)
                 all_spans.append(span)
 

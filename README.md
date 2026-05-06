@@ -164,3 +164,4 @@ This allows your backend to extract the `X-Amzn-Trace-Id` header that API Gatewa
 - **Latency**: Traces appear in Observe ~90 seconds after the original request (polling delay)
 - **HTTP APIs (V2)**: AWS HTTP APIs do not support X-Ray tracing — only REST APIs (V1) work
 - **Managed services only**: This poller is specifically for traces that AWS services send directly to X-Ray (API Gateway, DynamoDB, etc.). For your own code, use the OTel SDK directly — it's more efficient than going through X-Ray.
+- **Missing CLIENT span in waterfall**: The API Gateway subsegment (outgoing HTTP call) may appear as a "missing span" in Observe's trace waterfall. This is cosmetic — Observe's trace assembly drops CLIENT spans that arrive after the initial trace batch. The traces still stitch correctly by `trace_id`, and the root API Gateway span appears properly. This does not affect alerting, latency measurement, or debugging.
