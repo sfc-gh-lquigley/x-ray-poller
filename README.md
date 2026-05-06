@@ -138,6 +138,64 @@ propagate.set_global_textmap(CompositePropagator([
 ]))
 ```
 
+Install: `pip install opentelemetry-propagator-aws-xray opentelemetry-sdk opentelemetry-exporter-otlp`
+
+**Java (OTel Java Agent — zero-code instrumentation):**
+
+No code changes required. Attach the OTel Java Agent and configure via environment variables or system properties:
+
+```bash
+# Download the agent
+curl -sL https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.10.0/opentelemetry-javaagent.jar -o opentelemetry-javaagent.jar
+
+# Run your app with the agent
+java -javaagent:opentelemetry-javaagent.jar \
+    -Dotel.service.name=my-backend \
+    -Dotel.exporter.otlp.endpoint=http://localhost:4318 \
+    -Dotel.exporter.otlp.protocol=http/protobuf \
+    -Dotel.propagators=xray,tracecontext \
+    -jar my-app.jar
+```
+
+The key setting is `-Dotel.propagators=xray,tracecontext` — this enables the X-Ray propagator which extracts `X-Amzn-Trace-Id` headers from incoming requests.
+
+Alternatively, set via environment variables:
+```bash
+export OTEL_SERVICE_NAME=my-backend
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_PROPAGATORS=xray,tracecontext
+java -javaagent:opentelemetry-javaagent.jar -jar my-app.jar
+```
+
+**C++ (custom propagator — no official X-Ray propagator exists):**
+
+A hardened custom propagator is provided in [`examples/cpp/xray_propagator.h`](examples/cpp/xray_propagator.h). It parses the `X-Amzn-Trace-Id` header with:
+- Field-order independence (Root, Parent, Sampled can appear in any order)
+- Format validation (rejects malformed trace/span IDs)
+- Sampled=0 handling (skips span creation for unsampled requests)
+- Graceful fallback (bad/missing header → new trace, never crashes)
+
+Usage:
+```cpp
+#include "xray_propagator.h"
+
+// Extract from HTTP request headers (case-insensitive lookup)
+std::unordered_map<std::string, std::string> headers = get_request_headers();
+auto ctx = AwsXRayPropagator::extract(headers);
+
+if (ctx.has_value() && ctx->sampled) {
+    // Create span with extracted trace context
+    std::string trace_id = ctx->trace_id;         // 32 hex chars (OTLP format)
+    std::string parent_id = ctx->parent_span_id;  // 16 hex chars
+    // ... create OTel span with this parent context
+} else if (!ctx.has_value()) {
+    // No X-Ray header — start a new trace
+}
+```
+
+Build requirements: `g++ -std=c++17`, `libcurl` for OTLP HTTP export. See [`examples/cpp/build.sh`](examples/cpp/build.sh) for the full build script. Unit tests: `examples/cpp/xray_propagator_test.cpp` (13 test cases).
+
 This allows your backend to extract the `X-Amzn-Trace-Id` header that API Gateway passes through, using the same trace ID for its own spans.
 
 ## Troubleshooting
@@ -158,6 +216,8 @@ This allows your backend to extract the `X-Amzn-Trace-Id` header that API Gatewa
 | `lambda_function.py` | The Lambda function code |
 | `xray-poller.yaml` | Production CloudFormation (poller only) |
 | `xray-poller-test.yaml` | Test CloudFormation (includes demo API Gateway) |
+| `examples/java/` | Spring Boot backend with OTel Java Agent |
+| `examples/cpp/` | C++ backend with hardened custom X-Ray propagator |
 
 ## Limitations
 
