@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  X-Ray to Observe OTLP Poller - TEST STACK
+  Includes a demo API Gateway with X-Ray tracing for validation.
+  Delete this stack after testing; use xray-poller.yaml for production.
+
+Parameters:
+  ObserveCustomerId:
+    Type: String
+    Description: Observe tenant/customer ID (e.g., 146268791759)
+  ObserveToken:
+    Type: String
+    NoEcho: true
+    Description: "Observe ingest token in format datastream_token:bearer_token"
+  BackendUrl:
+    Type: String
+    Description: HTTP URL of the backend service (e.g., http://1.2.3.4:8080/demo)
+  PollIntervalMinutes:
+    Type: Number
+    Default: 1
+    Description: How often (in minutes) to poll X-Ray for new traces
+
+Resources:
+  # --- Demo API Gateway (for testing only) ---
+  DemoApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: xray-poller-test-api
+      Description: Test API Gateway with X-Ray tracing enabled
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  DemoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DemoApi
+      ParentId: !GetAtt DemoApi.RootResourceId
+      PathPart: demo
+
+  DemoMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DemoApi
+      ResourceId: !Ref DemoResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Ref BackendUrl
+
+  DemoDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: DemoMethod
+    Properties:
+      RestApiId: !Ref DemoApi
+
+  DemoStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DemoApi
+      DeploymentId: !Ref DemoDeployment
+      StageName: prod
+      TracingEnabled: true
+
+  # --- Poller Infrastructure ---
+  PollerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: xray-poller-dlq
+      MessageRetentionPeriod: 1209600
+
+  PollerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: xray-poller-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayReadOnlyAccess
+      Policies:
+        - PolicyName: DLQSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt PollerDLQ.Arn
+
+  PollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: xray-to-observe-poller
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt PollerRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt PollerDLQ.Arn
+      Environment:
+        Variables:
+          OBSERVE_CUSTOMER_ID: !Ref ObserveCustomerId
+          OBSERVE_TOKEN: !Ref ObserveToken
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual lambda_function.py content
+          # See lambda_function.py in this repository
+          def handler(event, context):
+              return {"statusCode": 200, "body": "placeholder"}
+
+  PollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: xray-poller-schedule
+      ScheduleExpression: !Sub "rate(${PollIntervalMinutes} minute)"
+      State: ENABLED
+      Targets:
+        - Id: PollerTarget
+          Arn: !GetAtt PollerFunction.Arn
+
+  PollerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollerScheduleRule.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: Test API Gateway endpoint (send GET requests here)
+    Value: !Sub "https://${DemoApi}.execute-api.${AWS::Region}.amazonaws.com/prod/demo"
+  PollerFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt PollerFunction.Arn
+  DLQUrl:
+    Description: Dead letter queue URL (check for failed invocations)
+    Value: !Ref PollerDLQ

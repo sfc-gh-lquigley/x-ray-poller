@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  X-Ray to Observe OTLP Poller
+  Polls AWS X-Ray API for traces (e.g., from API Gateway) and forwards them
+  as OTLP spans to an Observe tenant. Deploy this alongside your existing
+  API Gateway that has X-Ray tracing enabled.
+
+Parameters:
+  ObserveCustomerId:
+    Type: String
+    Description: Observe tenant/customer ID (e.g., 146268791759)
+  ObserveToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Observe ingest token in format "datastream_token:bearer_token".
+      Create one in Observe under Data & Integrations > Datastream Tokens.
+  PollIntervalMinutes:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2, 5]
+    Description: How often (in minutes) to poll X-Ray for new traces
+
+Resources:
+  PollerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq"
+      MessageRetentionPeriod: 1209600
+
+  PollerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayReadOnlyAccess
+      Policies:
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt PollerDLQ.Arn
+
+  PollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-function"
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Role: !GetAtt PollerRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      DeadLetterConfig:
+        TargetArn: !GetAtt PollerDLQ.Arn
+      Environment:
+        Variables:
+          OBSERVE_CUSTOMER_ID: !Ref ObserveCustomerId
+          OBSERVE_TOKEN: !Ref ObserveToken
+      Code:
+        ZipFile: |
+          # Placeholder - update with actual code from lambda_function.py
+          # Use: aws lambda update-function-code --function-name <name> --zip-file fileb://xray_poller.zip
+          def handler(event, context):
+              return {"statusCode": 200, "body": "placeholder - deploy real code"}
+
+  PollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-schedule"
+      ScheduleExpression: !Sub "rate(${PollIntervalMinutes} minute)"
+      State: ENABLED
+      Targets:
+        - Id: PollerTarget
+          Arn: !GetAtt PollerFunction.Arn
+
+  PollerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollerScheduleRule.Arn
+
+Outputs:
+  PollerFunctionName:
+    Description: Lambda function name (use with update-function-code)
+    Value: !Ref PollerFunction
+  PollerFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt PollerFunction.Arn
+  DLQUrl:
+    Description: Dead letter queue URL (check for failed invocations)
+    Value: !Ref PollerDLQ
+  NextStep:
+    Description: After stack creation, deploy the real Lambda code
+    Value: !Sub "aws lambda update-function-code --function-name ${PollerFunction} --zip-file fileb://xray_poller.zip --region ${AWS::Region}"
