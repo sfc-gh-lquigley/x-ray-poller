@@ -33,7 +33,7 @@ def epoch_to_nanos(ts):
     return str(int(ts * 1_000_000_000))
 
 
-def build_otlp_span(segment, trace_id_hex, is_subsegment=False):
+def build_otlp_span(segment, trace_id_hex, is_subsegment=False, root_end_time=None):
     if is_subsegment and segment.get("namespace") == "remote":
         kind = 3
     elif is_subsegment:
@@ -41,13 +41,24 @@ def build_otlp_span(segment, trace_id_hex, is_subsegment=False):
     else:
         kind = 2
 
+    start_ns = epoch_to_nanos(segment["start_time"])
+    end_ns = epoch_to_nanos(segment.get("end_time", segment["start_time"]))
+
+    # For zero-duration spans, use the root segment's end_time if available
+    # (API Gateway doesn't accurately record subsegment end times)
+    if end_ns == start_ns:
+        if root_end_time is not None:
+            end_ns = epoch_to_nanos(root_end_time)
+        else:
+            end_ns = str(int(start_ns) + 1_000_000)  # floor to 1ms as last resort
+
     span = {
         "traceId": trace_id_hex,
         "spanId": segment["id"],
         "name": segment.get("name", "unknown"),
         "kind": kind,
-        "startTimeUnixNano": epoch_to_nanos(segment["start_time"]),
-        "endTimeUnixNano": epoch_to_nanos(segment.get("end_time", segment["start_time"] + 0.001)),
+        "startTimeUnixNano": start_ns,
+        "endTimeUnixNano": end_ns,
         "attributes": [],
         "status": {},
     }
@@ -97,14 +108,14 @@ def build_otlp_span(segment, trace_id_hex, is_subsegment=False):
     return span
 
 
-def process_subsegments(subsegments, trace_id_hex, parent_span_id):
+def process_subsegments(subsegments, trace_id_hex, parent_span_id, root_end_time=None):
     spans = []
     for sub in subsegments:
-        sub_span = build_otlp_span(sub, trace_id_hex, is_subsegment=True)
+        sub_span = build_otlp_span(sub, trace_id_hex, is_subsegment=True, root_end_time=root_end_time)
         sub_span["parentSpanId"] = parent_span_id
         spans.append(sub_span)
         if "subsegments" in sub:
-            spans.extend(process_subsegments(sub["subsegments"], trace_id_hex, sub["id"]))
+            spans.extend(process_subsegments(sub["subsegments"], trace_id_hex, sub["id"], root_end_time=root_end_time))
     return spans
 
 
@@ -199,15 +210,18 @@ def handler(event, context):
             for seg_doc in trace_data.get("Segments", []):
                 segment = json.loads(seg_doc["Document"])
 
-                if segment.get("parent_id"):
+                # Skip X-Ray inferred segments — these are synthetic representations
+                # of OTel-instrumented backends; the real span comes from the OTel collector
+                if segment.get("inferred"):
                     continue
 
+                root_end_time = segment.get("end_time")
                 span = build_otlp_span(segment, trace_id_hex)
                 all_spans.append(span)
 
                 if "subsegments" in segment:
                     all_spans.extend(
-                        process_subsegments(segment["subsegments"], trace_id_hex, segment["id"])
+                        process_subsegments(segment["subsegments"], trace_id_hex, segment["id"], root_end_time=root_end_time)
                     )
 
     if not all_spans:
