@@ -168,33 +168,67 @@ export OTEL_PROPAGATORS=xray,tracecontext
 java -javaagent:opentelemetry-javaagent.jar -jar my-app.jar
 ```
 
-**C++ (custom propagator — no official X-Ray propagator exists):**
+**C++ (custom propagator required — no official X-Ray propagator exists for C++):**
 
-A hardened custom propagator is provided in [`examples/cpp/xray_propagator.h`](examples/cpp/xray_propagator.h). It parses the `X-Amzn-Trace-Id` header with:
-- Field-order independence (Root, Parent, Sampled can appear in any order)
-- Format validation (rejects malformed trace/span IDs)
-- Sampled=0 handling (skips span creation for unsampled requests)
-- Graceful fallback (bad/missing header → new trace, never crashes)
+Unlike Python and Java, C++ has no official AWS X-Ray propagator package. You have two options:
 
-Usage:
+**Option A: Use the provided custom propagator (recommended for most teams)**
+
+Level of effort: ~30 minutes to integrate into an existing C++ HTTP service.
+
+Steps:
+1. Copy [`examples/cpp/xray_propagator.h`](examples/cpp/xray_propagator.h) into your project
+2. Extract the `X-Amzn-Trace-Id` header from incoming HTTP requests
+3. Pass it through the propagator to get trace_id + parent_span_id
+4. Use those IDs when creating your OTel span (either via the opentelemetry-cpp SDK or manual OTLP export)
+
 ```cpp
 #include "xray_propagator.h"
 
-// Extract from HTTP request headers (case-insensitive lookup)
-std::unordered_map<std::string, std::string> headers = get_request_headers();
-auto ctx = AwsXRayPropagator::extract(headers);
+void handle_request(const HttpRequest& req) {
+    // Step 1: Extract headers into a map
+    std::unordered_map<std::string, std::string> headers;
+    for (auto& [k, v] : req.headers()) {
+        headers[k] = v;
+    }
 
-if (ctx.has_value() && ctx->sampled) {
-    // Create span with extracted trace context
-    std::string trace_id = ctx->trace_id;         // 32 hex chars (OTLP format)
-    std::string parent_id = ctx->parent_span_id;  // 16 hex chars
-    // ... create OTel span with this parent context
-} else if (!ctx.has_value()) {
-    // No X-Ray header — start a new trace
+    // Step 2: Parse the X-Ray trace context
+    auto ctx = AwsXRayPropagator::extract(headers);
+
+    // Step 3: Create your span with the extracted context
+    if (ctx.has_value() && ctx->sampled) {
+        std::string trace_id = ctx->trace_id;         // 32 hex chars (OTLP format)
+        std::string parent_id = ctx->parent_span_id;  // 16 hex chars
+        std::string span_id = generate_span_id();     // your 16 random hex chars
+
+        // Use these when creating your OTel span:
+        // - Set traceId = trace_id
+        // - Set parentSpanId = parent_id
+        // - Set spanId = span_id (new, random)
+    }
+
+    // If ctx is nullopt: no X-Ray header present, start a new trace
+    // If ctx->sampled is false: skip span creation (request is not sampled)
 }
 ```
 
-Build requirements: `g++ -std=c++17`, `libcurl` for OTLP HTTP export. See [`examples/cpp/build.sh`](examples/cpp/build.sh) for the full build script. Unit tests: `examples/cpp/xray_propagator_test.cpp` (13 test cases).
+The propagator handles: field-order independence, format validation, Sampled=0, graceful fallback on malformed input, case-insensitive header lookup, and unknown field tolerance. See the 13 unit tests in [`examples/cpp/xray_propagator_test.cpp`](examples/cpp/xray_propagator_test.cpp).
+
+**Option B: Full opentelemetry-cpp SDK integration (for production deployments)**
+
+Level of effort: 1-2 hours + 15-30 min build time. Requires cmake, protobuf, grpc, abseil.
+
+```bash
+# Build opentelemetry-cpp from source (requires ~2GB RAM)
+git clone --recurse-submodules https://github.com/open-telemetry/opentelemetry-cpp.git
+cd opentelemetry-cpp && mkdir build && cd build
+cmake .. -DWITH_OTLP_HTTP=ON -DBUILD_TESTING=OFF -DWITH_EXAMPLES=OFF
+make -j$(nproc) && sudo make install
+```
+
+Then implement `TextMapPropagator` interface using the same parsing logic from `xray_propagator.h`, register it globally, and let the SDK handle span lifecycle, batching, export, and graceful shutdown.
+
+**Build requirements (either option):** `g++ -std=c++17`, `libcurl-devel`. See [`examples/cpp/build.sh`](examples/cpp/build.sh) for the full build and test script.
 
 This allows your backend to extract the `X-Amzn-Trace-Id` header that API Gateway passes through, using the same trace ID for its own spans.
 
